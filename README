@@ -10,7 +10,7 @@ It is supposed to be a good tool for:
 Right now it only sorta does these things.
 
 You will need:
-  - Python 2.7, or a supported Python 3,
+  - A supported version of Python 3
     - (we support Python versions that are still getting updates), and
   - Tor binaries.
 
@@ -54,6 +54,7 @@ Verification Options:
 
 Timing Options:
   --start-time       CHUTNEY_START_TIME=N
+  --min-start-time   CHUTNEY_MIN_START_TIME=N
   --bootstrap-time   CHUTNEY_BOOTSTRAP_TIME=N
   --stop-time        CHUTNEY_STOP_TIME=N
 
@@ -70,11 +71,17 @@ Address/DNS Options:
   # Use tor's compile-time default for ServerDNSResolvConfFile
   --dns-conf-default CHUTNEY_DNS_CONF=""
 
+Sandbox Options:
+
+  --sandbox          CHUTNEY_TOR_SANDBOX=N (0 or 1)
+
 Warning Options:
   --all-warnings     CHUTNEY_WARNINGS_IGNORE_EXPECTED=false
                      CHUTNEY_WARNINGS_SUMMARY=false
   --no-warnings      CHUTNEY_WARNINGS_SKIP=true
   --only-warnings    CHUTNEY_WARNINGS_ONLY=true
+  --diagnostics      CHUTNEY_DIAGNOSTICS=true
+  --only-diagnostics CHUTNEY_DIAGNOSTICS_ONLY=true
 
 Expert Options:
   --debug            CHUTNEY_DEBUG=true
@@ -151,21 +158,103 @@ Multiple Tests:
   CHUTNEY_CONNECTIONS=N to make multiple connections within each verification
   round. Any round or connection failure will fail the current test.
 
-Waiting for the network:
+Bootstrapping the network:
+
+  Chutney expects a tor network to bootstrap in these stages:
+    1.  All directory authorities (DirAuths) bootstrap to 100%.
+    2.  The DirAuths produce the first consensus.
+        Usually, this consensus only contains authorities.
+    3.  The DirAuths produce a bootstrap consensus.
+        This consensus has enough relays for:
+          * clients and relays to bootstrap, and
+          * relays to perform reachability self-tests.
+        Usually, this consensus needs at least 3 nodes.
+        This consensus is usually the first or second consensus.
+
+    4.  Relays bootstrap to 100%.
+    5.  Relays with "AssumeReachable 1" publish their descriptors to the
+        DirAuths.
+
+    6.  Relays perform ORPort reachability self-tests.
+        If the consensus contains at least 1 exit, relays also perform DirPort
+        reachability self-tests.
+    7.  Relays publish their descriptors to the DirAuths.
+    8.  The DirAuths produce a complete consensus, microdesc consensus, and
+        microdescriptors. A complete consensus contains:
+          * the authorities,
+          * any bridge authorities, if present, and
+          * all relays (including exits).
+        Bridges, clients, and onion services are not included in the consensus.
+
+    9.  Bridges publish their descriptors to the Bridge Auth.
+    10. The Bridge Auth produces a bridge networkstatus.
+
+    11. Relays and bridges download all consensus flavours, then download
+        descriptors and microdescriptors.
+    12. Bridge clients download the descriptors for their bridges.
+    13. Clients (including bridge clients, and onion services), download the
+        most recent microdesc consensus, and microdescriptors.
+    14. Clients bootstrap to 100%.
+        (Clients can bootstrap as soon as the consensus contains enough nodes,
+        so this step can depend on step 3, not step 13.)
+
+    15. Onion Services publish their descriptors to Onion Service directories
+        (otherwise known as hidden service directories, or HSDirs).
 
   The tools/test-network.sh script uses the chutney wait_for_bootstrap
-  command to wait for up to CHUTNEY_START_TIME seconds (default: 120), checking
-  whether the logged bootstrapped status for every node is 100%. It it is,
-  great: it succeeds. If not, it dumps the bootstrap statuses and exits.
-  test-network.sh does not exit immediately if a tor node fails to bootstrap.
-  Instead, it attempts to verify. We'll add an option to fail on tor
-  bootstrap failure in #20473.
+  command to wait for the network to bootstrap.
+
+  wait_for_bootstrap waits up to CHUTNEY_START_TIME seconds (default: 120),
+  checking whether:
+    * the logged bootstrapped status for every node is 100% (steps 9 and 14),
+      and
+    * directory information has been distributed throughout the network
+      (steps 7-8, 11-13).
+
+  When waiting for dir info distribution, wait_for_bootstrap checks if:
+    * each relay descriptor has been posted to every authority (step 7),
+    * each relay is in the consensus, and the microdesc consensus, at every
+      authority (step 8),
+    * a complete consensus and microdesc consensus has been distributed to
+      relays and bridges (step 11),
+    * all authority and relay descriptors have been distributed to relays
+      and bridges (step 11),
+    * all bridge descriptors have been distributed to all bridge clients
+      (step 12), and
+    * a complete microdesc consensus has been distributed to clients
+      (step 13).
+
+  wait_for_bootstrap does not currently check the following dir info:
+    * microdescriptors (steps 8, 11, and 13, chutney ticket #33407),
+    * bridge descriptors at the bridge authority (steps 9-10,
+      tor ticket #33582, chutney ticket #33428), and
+    * onion services have published their descriptors to the HSDirs (step 15,
+      chutney ticket #33609).
+
+  After bootstrapping and dir info distribution, wait_for_bootstrap waits
+  until the network has been running for at least CHUTNEY_MIN_START_TIME
+  seconds (default 0 seconds for tor > 0.3.5.*, 65 seconds for tor <= 0.3.5.*),
+  to compensate for microdesc download issues in older tor versions.
+
+  In addition, wait_for_bootstrap also waits an extra:
+    * 10 seconds for clients to download microdescs, and
+    * 30 seconds for onion services to upload their descriptors.
+  We expect that these delays will be removed, once the relevant checks are
+  implemented in chutney.
+
+  If the CHUTNEY_START_TIME has elapsed, and some nodes have not bootstrapped,
+  or there are some nodes missing from the consensus, wait_for_bootstrap dumps
+  the bootstrap statuses, and exits with a failure.
+
+Verifying the network:
 
   Commands like "chutney verify" start immediately, and keep trying for
   CHUTNEY_BOOTSTRAP_TIME seconds (default: 60). If it hasn't been
   successful after that time, it fails. If CHUTNEY_BOOTSTRAP_TIME is negative,
   the script leaves the network running, and exits after CHUTNEY_START_TIME
   (without verifying).
+
+Shutting down the network:
 
   The tools/test-network.sh script waits CHUTNEY_STOP_TIME seconds
   after verifying, then exits (default: immediately). If CHUTNEY_STOP_TIME is
@@ -214,15 +303,26 @@ Using DNS:
    provides a local resolv.conf file containing IPv4, IPv6, and "localhost".
    Use --dns-conf resolv.conf (relative paths work).
 
+The tor sandbox:
+
+   Chutney can run with the tor seccomp sandbox enabled. But if tor's sandbox
+   is broken on your local version of glibc, you can set CHUTNEY_TOR_SANDBOX=0
+   to disable the sandbox. If CHUTNEY_TOR_SANDBOX is unset, Sandbox defaults
+   to 1 on Linux, and 0 on other platforms.
+
 The configuration files:
 
   networks/basic holds the configuration for the network you're configuring
   above.  It refers to some torrc template files in torrc_templates/.
 
+  Chutney uses a templating system to produce torrc files from the templates.
+  These torrc files can be modified using various chutney options.
+
 The working files:
 
-  chutney sticks its working files, including all data directories, log
-  files, etc, in ./net/.  Each tor instance gets a subdirectory of net/nodes.
+  chutney sticks its working files, including all generated torrc files,
+  data directories, log files, etc, in ./net/.  Each tor instance gets a
+  subdirectory of net/nodes.
 
   You can override the directory "./net" with the CHUTNEY_DATA_DIR
   environment variable.
